@@ -5,13 +5,14 @@ import subprocess
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
-# Charger le fichier .env situé dans le dossier du projet
-load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
 WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
-STATE_FILE = Path(__file__).resolve().parent / "seen.json"
+STATE_FILE = BASE_DIR / "seen.json"
 
 FEEDS = [
     "https://www.cisa.gov/uscert/ncas/all.xml",
@@ -22,12 +23,8 @@ MAX_ALERTS_PER_RUN = 5
 
 
 def send_discord(message):
-    """Envoyer un message Discord via curl."""
-
     if not WEBHOOK:
-        raise RuntimeError(
-            "DISCORD_WEBHOOK absent. Vérifie le fichier .env."
-        )
+        raise RuntimeError("Secret DISCORD_WEBHOOK absent.")
 
     payload = json.dumps(
         {"content": message[:1900]},
@@ -36,9 +33,7 @@ def send_discord(message):
 
     result = subprocess.run(
         [
-            "curl",
-            "-sS",
-            "-o", "/dev/null",
+            "curl", "-sS", "-o", "/dev/null",
             "-w", "%{http_code}",
             "--max-time", "20",
             "-H", "Content-Type: application/json",
@@ -51,77 +46,62 @@ def send_discord(message):
     )
 
     status = result.stdout.strip()
-
     if result.returncode != 0 or status not in ("200", "204"):
         raise RuntimeError(
-            f"Échec envoi Discord : HTTP {status or 'inconnu'} "
+            f"Erreur Discord HTTP {status or '?'}: "
             f"{result.stderr.strip()}"
         )
 
 
 def fetch(url):
-    """Télécharger une page ou un flux RSS."""
-
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "DiscordSentinel/1.0"},
     )
-
     with urllib.request.urlopen(request, timeout=20) as response:
         return response.read()
 
 
 def get_items(xml_data):
-    """Extraire les articles d'un flux RSS ou Atom."""
-
     root = ET.fromstring(xml_data)
     items = []
 
-    # Format RSS
     for item in root.findall(".//item"):
-        title = item.findtext("title", default="Sans titre")
-        link = item.findtext("link", default="")
-        guid = item.findtext("guid", default=link or title)
-        items.append((guid, title, link))
+        title = item.findtext("title", default="Sans titre").strip()
+        link = item.findtext("link", default="").strip()
+        guid = item.findtext("guid", default=link or title).strip()
+        description = item.findtext("description", default="")
+        items.append((guid, title, link, description))
 
-    # Format Atom
     namespace = {"a": "http://www.w3.org/2005/Atom"}
 
     if not items:
         for item in root.findall(".//a:entry", namespace):
             title = item.findtext(
-                "a:title",
-                default="Sans titre",
+                "a:title", default="Sans titre",
                 namespaces=namespace,
-            )
-
+            ).strip()
             link_element = item.find("a:link", namespace)
             link = (
                 link_element.get("href", "")
-                if link_element is not None
-                else ""
+                if link_element is not None else ""
             )
-
             guid = item.findtext(
-                "a:id",
-                default=link or title,
+                "a:id", default=link or title,
+                namespaces=namespace,
+            ).strip()
+            description = item.findtext(
+                "a:summary", default="",
                 namespaces=namespace,
             )
-
-            items.append((guid, title, link))
+            items.append((guid, title, link, description))
 
     return items
 
 
 def main():
-    print("🤖 Démarrage de la sentinelle...")
-
-    # Vérifier immédiatement que Discord fonctionne.
-    send_discord(
-        "🤖 **Sentinelle démarrée**\n"
-        "Surveillance de klineme.fr et des alertes de sécurité."
-    )
-    print("✅ Message de démarrage envoyé à Discord.")
+    now = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+    print(f"Début de la vérification : {now}")
 
     try:
         seen = json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -129,68 +109,105 @@ def main():
         seen = {"items": [], "site_down": False}
 
     old_items = set(seen.get("items", []))
+    is_first_run = not old_items
     new_items = []
+    feed_results = []
+    all_guids = set(old_items)
 
-    # Lire les flux de sécurité.
+    # Récupération des actualités de sécurité
     for feed in FEEDS:
         try:
             items = get_items(fetch(feed))
+            feed_results.append(
+                f"✅ Flux CISA accessible : {len(items)} article(s) trouvé(s)"
+            )
 
-            for guid, title, link in items:
-                if guid and guid not in old_items:
-                    new_items.append((guid, title, link))
-
-            print(f"✅ Flux vérifié : {feed}")
+            for guid, title, link, description in items:
+                if guid:
+                    all_guids.add(guid)
+                    if guid not in old_items:
+                        new_items.append(
+                            (guid, title, link, description)
+                        )
 
         except Exception as exc:
-            print(f"⚠️ Flux indisponible : {feed} : {exc}")
+            feed_results.append(
+                f"⚠️ Flux indisponible : {str(exc)[:250]}"
+            )
 
-    # Au premier lancement, mémoriser les anciens articles
-    # sans envoyer toutes les anciennes alertes.
-    if not old_items:
-        old_items.update(guid for guid, _, _ in new_items)
+    # Au premier lancement, enregistrer les articles existants
+    # sans les présenter comme des nouveautés.
+    if is_first_run:
         new_items = []
-        print("ℹ️ Premier lancement : historique initialisé.")
+        print("Premier lancement : historique initialisé.")
 
-    # Envoyer les nouveaux articles.
-    for guid, title, link in new_items[:MAX_ALERTS_PER_RUN]:
-        send_discord(
-            f"🛡️ **Nouvelle alerte de sécurité**\n"
-            f"{title}\n{link}"
+    sent_count = 0
+
+    for guid, title, link, description in new_items[:MAX_ALERTS_PER_RUN]:
+        summary = " ".join(description.split())
+        if len(summary) > 500:
+            summary = summary[:497] + "..."
+
+        message = (
+            f"🛡️ **Nouvelle actualité de cybersécurité**\n"
+            f"**{title}**\n"
         )
+        if summary:
+            message += f"{summary}\n"
+        if link:
+            message += link
 
-        old_items.add(guid)
-        print(f"📨 Alerte envoyée : {title}")
+        send_discord(message)
+        sent_count += 1
+        print(f"Actualité envoyée : {title}")
 
-    # Vérifier le site.
+    # Vérification de la disponibilité du site
     site_down = seen.get("site_down", False)
 
     try:
         fetch(SITE)
-
-        print(f"✅ Site accessible : {SITE}")
+        site_status = f"✅ Site accessible : {SITE}"
 
         if site_down:
-            send_discord(
-                f"✅ Le site **{SITE}** répond de nouveau."
-            )
+            send_discord(f"✅ Le site **{SITE}** répond de nouveau.")
 
         site_down = False
 
     except Exception as exc:
-        print(f"⚠️ Site inaccessible : {exc}")
+        site_status = f"🚨 Site inaccessible : {str(exc)[:200]}"
 
         if not site_down:
             send_discord(
-                f"🚨 **Le site {SITE} ne répond pas correctement.**\n"
+                f"🚨 **Le site {SITE} semble inaccessible**\n"
                 f"Erreur : {str(exc)[:250]}"
             )
 
         site_down = True
 
-    # Enregistrer l'historique.
+    # Bilan systématique à chaque exécution
+    if is_first_run:
+        news_status = (
+            f"Initialisation : {len(all_guids)} article(s) "
+            "historique(s) mémorisé(s), sans anciennes alertes."
+        )
+    elif new_items:
+        news_status = (
+            f"📰 {len(new_items)} nouvelle(s) actualité(s) détectée(s), "
+            f"{sent_count} envoyée(s) cette fois."
+        )
+    else:
+        news_status = "📰 Aucune nouvelle actualité détectée."
+
+    report = [
+        f"📋 **Bilan Discord Sentinel — {now}**",
+        news_status,
+        *feed_results,
+        site_status,
+    ]
+    send_discord("\n".join(report))
+
     state = {
-        "items": list(old_items)[-500:],
+        "items": list(all_guids)[-500:],
         "site_down": site_down,
     }
 
@@ -199,13 +216,8 @@ def main():
         encoding="utf-8",
     )
 
-    print("✅ Vérification terminée.")
+    print("Vérification terminée.")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        print(f"❌ Erreur de la sentinelle : {exc}")
-        raise
-
+    main()
