@@ -17,7 +17,7 @@ STATE_FILE = BASE_DIR / "seen.json"
 
 
 FEEDS = [
-    "https://www.cisa.gov/cybersecurity-advisories/alerts.xml",
+    "https://www.cert.ssi.gouv.fr/alerte/feed/",
 ]
 SITE = "https://klineme.fr"
 MAX_ALERTS_PER_RUN = 5
