@@ -14,10 +14,11 @@ load_dotenv(BASE_DIR / ".env")
 WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
 STATE_FILE = BASE_DIR / "seen.json"
 
-FEEDS = [
-    "https://www.cisa.gov/uscert/ncas/all.xml",
-]
 
+
+FEEDS = [
+    "https://www.cisa.gov/cybersecurity-advisories/alerts.xml",
+]
 SITE = "https://klineme.fr"
 MAX_ALERTS_PER_RUN = 5
 
